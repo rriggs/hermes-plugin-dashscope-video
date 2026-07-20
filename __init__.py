@@ -1,0 +1,373 @@
+"""DashScope (Qwen Cloud) video generation backend.
+
+Exposes Alibaba Cloud Model Studio's HappyHorse video models through
+the native DashScope async task API as a VideoGenProvider.
+
+Models on the token plan:
+  - happyhorse-1.1-t2v:  Text-to-video
+  - happyhorse-1.1-i2v:  Image-to-video
+  - happyhorse-1.1-r2v:  Reference-to-video
+
+API flow (async -- the token plan REQUIRES async for video):
+  1. POST {base}/api/v1/services/aigc/video-generation/video-synthesis
+     with X-DashScope-Async: enable  -->  returns task_id
+  2. GET  {base}/api/v1/tasks/{task_id}  -->  poll until SUCCEEDED/FAILED
+  3. Download video from output URL, cache locally.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional
+
+from agent.video_gen_provider import (
+    DEFAULT_ASPECT_RATIO,
+    DEFAULT_RESOLUTION,
+    VideoGenProvider,
+    error_response,
+    save_url_video,
+    success_response,
+)
+
+logger = logging.getLogger(__name__)
+
+_MODELS = [
+    {
+        "id": "happyhorse-1.1-t2v",
+        "display": "HappyHorse 1.1 T2V",
+        "speed": "~90s",
+        "strengths": "Text-to-video, cinematic quality",
+        "price": "Token plan included",
+        "modalities": ["text"],
+    },
+    {
+        "id": "happyhorse-1.1-i2v",
+        "display": "HappyHorse 1.1 I2V",
+        "speed": "~90s",
+        "strengths": "Image-to-video animation",
+        "price": "Token plan included",
+        "modalities": ["image"],
+    },
+    {
+        "id": "happyhorse-1.1-r2v",
+        "display": "HappyHorse 1.1 R2V",
+        "speed": "~90s",
+        "strengths": "Reference-to-video, style transfer",
+        "price": "Token plan included",
+        "modalities": ["image"],
+    },
+]
+
+# Polling config
+_POLL_INTERVAL_S = 5.0
+_POLL_DEADLINE_S = 600.0  # 10 minutes max
+
+# Default base URL -- Singapore token plan endpoint.
+_DEFAULT_BASE_URL = "https://token-plan.ap-southeast-1.maas.aliyuncs.com"
+
+# Aspect ratio mapping: Hermes uses "16:9" style, DashScope uses "1280*720"
+_ASPECT_TO_SIZE = {
+    "16:9": "1280*720",
+    "9:16": "720*1280",
+    "1:1": "960*960",
+    "4:3": "1024*768",
+    "3:4": "768*1024",
+}
+
+
+def _base_url() -> str:
+    return os.environ.get("DASHSCOPE_BASE_URL", "").strip() or _DEFAULT_BASE_URL
+
+
+def _load_dashscope_video_config() -> Dict[str, Any]:
+    """Read ``video_gen.dashscope`` from config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        section = cfg.get("video_gen") if isinstance(cfg, dict) else None
+        ds = section.get("dashscope") if isinstance(section, dict) else None
+        return ds if isinstance(ds, dict) else {}
+    except Exception as exc:
+        logger.debug("Could not load video_gen.dashscope config: %s", exc)
+        return {}
+
+
+class DashScopeVideoGenProvider(VideoGenProvider):
+    """Alibaba Cloud DashScope / Qwen Cloud video generation backend.
+
+    Uses the native DashScope async task API. The token plan endpoint
+    requires async mode (X-DashScope-Async: enable) for video models.
+    """
+
+    @property
+    def name(self) -> str:
+        return "dashscope"
+
+    @property
+    def display_name(self) -> str:
+        return "DashScope (Qwen Cloud)"
+
+    def is_available(self) -> bool:
+        return bool(os.environ.get("QWEN_API_KEY", "").strip())
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        return list(_MODELS)
+
+    def default_model(self) -> Optional[str]:
+        return "happyhorse-1.1-t2v"
+
+    def capabilities(self) -> Dict[str, Any]:
+        return {
+            "modalities": ["text", "image"],
+            "aspect_ratios": list(_ASPECT_TO_SIZE.keys()),
+            "resolutions": ["720p"],
+            "max_duration": 10,
+            "min_duration": 3,
+            "supports_audio": False,
+            "supports_negative_prompt": False,
+            "max_reference_images": 1,
+        }
+
+    def get_setup_schema(self) -> Dict[str, Any]:
+        return {
+            "name": "DashScope (Qwen Cloud)",
+            "badge": "token-plan",
+            "tag": "HappyHorse 1.1 video models via Alibaba Cloud Model Studio",
+            "env_vars": [
+                {
+                    "key": "QWEN_API_KEY",
+                    "prompt": "Qwen Cloud API key (sk-sp-* for token plan)",
+                    "url": "https://modelstudio.console.alibabacloud.com/",
+                },
+            ],
+        }
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        model: Optional[str] = None,
+        image_url: Optional[str] = None,
+        reference_image_urls: Optional[List[str]] = None,
+        duration: Optional[int] = None,
+        aspect_ratio: str = DEFAULT_ASPECT_RATIO,
+        resolution: str = DEFAULT_RESOLUTION,
+        negative_prompt: Optional[str] = None,
+        audio: Optional[bool] = None,
+        seed: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return error_response(
+                error="Prompt is required",
+                error_type="invalid_request",
+                provider=self.name,
+            )
+
+        api_key = os.environ.get("QWEN_API_KEY", "").strip()
+        if not api_key:
+            return error_response(
+                error="QWEN_API_KEY not set. Run `hermes tools` -> Video Generation -> DashScope.",
+                error_type="missing_credentials",
+                provider=self.name,
+            )
+
+        # Model selection: explicit > config > default
+        ds_cfg = _load_dashscope_video_config()
+        model_id = model or ds_cfg.get("model") or self.default_model()
+
+        # Route based on modality
+        if image_url:
+            # Image-to-video: switch to i2v model if user picked t2v
+            if model_id == "happyhorse-1.1-t2v":
+                model_id = "happyhorse-1.1-i2v"
+            modality = "image"
+        elif reference_image_urls:
+            if model_id == "happyhorse-1.1-t2v":
+                model_id = "happyhorse-1.1-r2v"
+            modality = "image"
+        else:
+            # Text-to-video: switch to t2v if user picked i2v/r2v without image
+            if model_id in ("happyhorse-1.1-i2v", "happyhorse-1.1-r2v"):
+                model_id = "happyhorse-1.1-t2v"
+            modality = "text"
+
+        # Clamp duration
+        dur = duration or 5
+        dur = max(3, min(10, dur))
+
+        # Build request payload
+        size = _ASPECT_TO_SIZE.get(aspect_ratio, "1280*720")
+
+        input_data: Dict[str, Any] = {"prompt": prompt}
+        if image_url and model_id == "happyhorse-1.1-i2v":
+            input_data["image_url"] = image_url
+        elif reference_image_urls and model_id == "happyhorse-1.1-r2v":
+            input_data["ref_image_url"] = reference_image_urls[0]
+
+        payload = {
+            "model": model_id,
+            "input": input_data,
+            "parameters": {
+                "duration": dur,
+                "size": size,
+            },
+        }
+
+        base = _base_url().rstrip("/")
+        submit_url = f"{base}/api/v1/services/aigc/video-generation/video-synthesis"
+
+        try:
+            import requests
+
+            # Step 1: Submit async task
+            resp = requests.post(
+                submit_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "X-DashScope-Async": "enable",
+                },
+                json=payload,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            submit_data = resp.json()
+        except Exception as exc:
+            logger.debug("DashScope video submit failed", exc_info=True)
+            return error_response(
+                error=f"DashScope video submit failed: {exc}",
+                error_type="api_error",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+            )
+
+        # Check for submit errors
+        if submit_data.get("code"):
+            return error_response(
+                error=f"DashScope error: {submit_data['code']}: {submit_data.get('message', '')}",
+                error_type="api_error",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+            )
+
+        task_id = submit_data.get("output", {}).get("task_id")
+        if not task_id:
+            return error_response(
+                error="DashScope did not return a task_id",
+                error_type="empty_response",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+            )
+
+        # Step 2: Poll until terminal
+        poll_url = f"{base}/api/v1/tasks/{task_id}"
+        deadline = time.monotonic() + _POLL_DEADLINE_S
+        terminal_states = {"SUCCEEDED", "FAILED", "CANCELED", "UNKNOWN"}
+        task_status = "PENDING"
+
+        try:
+            while task_status not in terminal_states:
+                if time.monotonic() >= deadline:
+                    return error_response(
+                        error=f"Video generation timed out after {int(_POLL_DEADLINE_S)}s (task {task_id})",
+                        error_type="timeout",
+                        provider=self.name,
+                        model=model_id,
+                        prompt=prompt,
+                    )
+                time.sleep(_POLL_INTERVAL_S)
+                poll_resp = requests.get(
+                    poll_url,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=30,
+                )
+                poll_resp.raise_for_status()
+                poll_data = poll_resp.json()
+                task_status = poll_data.get("output", {}).get("task_status", "UNKNOWN")
+        except error_response.__class__:
+            raise
+        except Exception as exc:
+            logger.debug("DashScope video poll failed", exc_info=True)
+            return error_response(
+                error=f"DashScope video polling failed: {exc}",
+                error_type="api_error",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+            )
+
+        if task_status != "SUCCEEDED":
+            fail_msg = poll_data.get("output", {}).get("message", task_status)
+            return error_response(
+                error=f"Video generation {task_status}: {fail_msg}",
+                error_type="generation_failed",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+            )
+
+        # Step 3: Extract video URL from result
+        # Shape: output.video_url OR output.results[].url
+        video_url: Optional[str] = None
+        output = poll_data.get("output", {})
+        video_url = output.get("video_url")
+        if not video_url:
+            results = output.get("results") or []
+            for r in results:
+                if isinstance(r, dict) and r.get("url"):
+                    video_url = r["url"]
+                    break
+        if not video_url:
+            # Try nested: output.choices[].message.content[].video
+            choices = output.get("choices") or []
+            for c in choices:
+                msg = c.get("message", {})
+                for item in msg.get("content", []):
+                    if isinstance(item, dict):
+                        video_url = item.get("video") or item.get("url")
+                        if video_url:
+                            break
+                if video_url:
+                    break
+
+        if not video_url:
+            return error_response(
+                error="DashScope video task succeeded but no video URL found in response",
+                error_type="empty_response",
+                provider=self.name,
+                model=model_id,
+                prompt=prompt,
+            )
+
+        # Step 4: Download and cache locally (URLs are ephemeral)
+        short = model_id.replace(".", "_").replace("-", "_")
+        try:
+            saved_path = save_url_video(video_url, prefix=f"dashscope_{short}")
+            video_ref = str(saved_path)
+        except Exception as exc:
+            logger.debug("DashScope: caching video URL failed (%s); returning URL", exc)
+            video_ref = video_url
+
+        return success_response(
+            video=video_ref,
+            model=model_id,
+            prompt=prompt,
+            modality=modality,
+            aspect_ratio=aspect_ratio,
+            duration=dur,
+            provider=self.name,
+            extra={"task_id": task_id, "size": size},
+        )
+
+
+def register(ctx) -> None:
+    """Plugin entry point -- wire DashScopeVideoGenProvider into the registry."""
+    ctx.register_video_gen_provider(DashScopeVideoGenProvider())

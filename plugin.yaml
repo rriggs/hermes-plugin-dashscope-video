@@ -1,0 +1,7 @@
+name: dashscope
+version: 1.0.0
+description: "DashScope (Qwen Cloud) video generation -- HappyHorse 1.1 models via Alibaba Cloud Model Studio. Async task API. Works with token plan (sk-sp-*) keys."
+author: Sven (Mobilinkd)
+kind: backend
+requires_env:
+  - QWEN_API_KEY
