@@ -3,15 +3,33 @@
 Exposes Alibaba Cloud Model Studio's HappyHorse video models through
 the native DashScope async task API as a VideoGenProvider.
 
-Models on the token plan:
+Configuration (config.yaml):
+
+    video_gen:
+      provider: dashscope
+      dashscope:
+        api: https://token-plan.ap-southeast-1.maas.aliyuncs.com
+        key_env: QWEN_API_KEY
+        model: happyhorse-1.1-t2v    # optional default model
+
+All keys are optional. Defaults:
+  - api:     https://token-plan.ap-southeast-1.maas.aliyuncs.com
+  - key_env: QWEN_API_KEY
+  - model:   happyhorse-1.1-t2v
+
+For PAYG users:
+  - api:     https://dashscope-intl.aliyuncs.com
+  - key_env: DASHSCOPE_API_KEY
+
+Models:
   - happyhorse-1.1-t2v:  Text-to-video
   - happyhorse-1.1-i2v:  Image-to-video
   - happyhorse-1.1-r2v:  Reference-to-video
 
-API flow (async -- the token plan REQUIRES async for video):
-  1. POST {base}/api/v1/services/aigc/video-generation/video-synthesis
+API flow (async -- required for video on both token plan and PAYG):
+  1. POST {api}/api/v1/services/aigc/video-generation/video-synthesis
      with X-DashScope-Async: enable  -->  returns task_id
-  2. GET  {base}/api/v1/tasks/{task_id}  -->  poll until SUCCEEDED/FAILED
+  2. GET  {api}/api/v1/tasks/{task_id}  -->  poll until SUCCEEDED/FAILED
   3. Download video from output URL, cache locally.
 """
 
@@ -64,8 +82,9 @@ _MODELS = [
 _POLL_INTERVAL_S = 5.0
 _POLL_DEADLINE_S = 600.0  # 10 minutes max
 
-# Default base URL -- Singapore token plan endpoint.
-_DEFAULT_BASE_URL = "https://token-plan.ap-southeast-1.maas.aliyuncs.com"
+# Defaults when config keys are absent.
+_DEFAULT_API = "https://token-plan.ap-southeast-1.maas.aliyuncs.com"
+_DEFAULT_KEY_ENV = "QWEN_API_KEY"
 
 # Aspect ratio mapping: Hermes uses "16:9" style, DashScope uses "1280*720"
 _ASPECT_TO_SIZE = {
@@ -77,11 +96,7 @@ _ASPECT_TO_SIZE = {
 }
 
 
-def _base_url() -> str:
-    return os.environ.get("DASHSCOPE_BASE_URL", "").strip() or _DEFAULT_BASE_URL
-
-
-def _load_dashscope_video_config() -> Dict[str, Any]:
+def _load_config() -> Dict[str, Any]:
     """Read ``video_gen.dashscope`` from config.yaml."""
     try:
         from hermes_cli.config import load_config
@@ -95,11 +110,28 @@ def _load_dashscope_video_config() -> Dict[str, Any]:
         return {}
 
 
+def _resolve_api(cfg: Dict[str, Any]) -> str:
+    """Resolve the API base URL: config > default."""
+    api = cfg.get("api", "")
+    if isinstance(api, str) and api.strip():
+        return api.strip().rstrip("/")
+    return _DEFAULT_API
+
+
+def _resolve_key_env(cfg: Dict[str, Any]) -> str:
+    """Resolve the env var name holding the API key: config > default."""
+    key_env = cfg.get("key_env", "")
+    if isinstance(key_env, str) and key_env.strip():
+        return key_env.strip()
+    return _DEFAULT_KEY_ENV
+
+
 class DashScopeVideoGenProvider(VideoGenProvider):
     """Alibaba Cloud DashScope / Qwen Cloud video generation backend.
 
-    Uses the native DashScope async task API. The token plan endpoint
-    requires async mode (X-DashScope-Async: enable) for video models.
+    Uses the native DashScope async task API. Both the token plan and
+    PAYG endpoints require async mode (X-DashScope-Async: enable) for
+    video models.
     """
 
     @property
@@ -111,7 +143,9 @@ class DashScopeVideoGenProvider(VideoGenProvider):
         return "DashScope (Qwen Cloud)"
 
     def is_available(self) -> bool:
-        return bool(os.environ.get("QWEN_API_KEY", "").strip())
+        cfg = _load_config()
+        key_env = _resolve_key_env(cfg)
+        return bool(os.environ.get(key_env, "").strip())
 
     def list_models(self) -> List[Dict[str, Any]]:
         return list(_MODELS)
@@ -139,7 +173,7 @@ class DashScopeVideoGenProvider(VideoGenProvider):
             "env_vars": [
                 {
                     "key": "QWEN_API_KEY",
-                    "prompt": "Qwen Cloud API key (sk-sp-* for token plan)",
+                    "prompt": "Qwen Cloud API key (sk-sp-* for token plan, sk-ws-* for PAYG)",
                     "url": "https://modelstudio.console.alibabacloud.com/",
                 },
             ],
@@ -168,21 +202,25 @@ class DashScopeVideoGenProvider(VideoGenProvider):
                 provider=self.name,
             )
 
-        api_key = os.environ.get("QWEN_API_KEY", "").strip()
+        cfg = _load_config()
+        key_env = _resolve_key_env(cfg)
+        api_key = os.environ.get(key_env, "").strip()
         if not api_key:
             return error_response(
-                error="QWEN_API_KEY not set. Run `hermes tools` -> Video Generation -> DashScope.",
+                error=(
+                    f"{key_env} not set. Configure video_gen.dashscope.key_env "
+                    f"in config.yaml and set the env var, or run `hermes tools` "
+                    f"-> Video Generation -> DashScope."
+                ),
                 error_type="missing_credentials",
                 provider=self.name,
             )
 
         # Model selection: explicit > config > default
-        ds_cfg = _load_dashscope_video_config()
-        model_id = model or ds_cfg.get("model") or self.default_model()
+        model_id = model or cfg.get("model") or self.default_model()
 
         # Route based on modality
         if image_url:
-            # Image-to-video: switch to i2v model if user picked t2v
             if model_id == "happyhorse-1.1-t2v":
                 model_id = "happyhorse-1.1-i2v"
             modality = "image"
@@ -191,7 +229,6 @@ class DashScopeVideoGenProvider(VideoGenProvider):
                 model_id = "happyhorse-1.1-r2v"
             modality = "image"
         else:
-            # Text-to-video: switch to t2v if user picked i2v/r2v without image
             if model_id in ("happyhorse-1.1-i2v", "happyhorse-1.1-r2v"):
                 model_id = "happyhorse-1.1-t2v"
             modality = "text"
@@ -218,7 +255,7 @@ class DashScopeVideoGenProvider(VideoGenProvider):
             },
         }
 
-        base = _base_url().rstrip("/")
+        base = _resolve_api(cfg)
         submit_url = f"{base}/api/v1/services/aigc/video-generation/video-synthesis"
 
         try:
@@ -272,6 +309,7 @@ class DashScopeVideoGenProvider(VideoGenProvider):
         deadline = time.monotonic() + _POLL_DEADLINE_S
         terminal_states = {"SUCCEEDED", "FAILED", "CANCELED", "UNKNOWN"}
         task_status = "PENDING"
+        poll_data: Dict[str, Any] = {}
 
         try:
             while task_status not in terminal_states:
@@ -292,8 +330,6 @@ class DashScopeVideoGenProvider(VideoGenProvider):
                 poll_resp.raise_for_status()
                 poll_data = poll_resp.json()
                 task_status = poll_data.get("output", {}).get("task_status", "UNKNOWN")
-        except error_response.__class__:
-            raise
         except Exception as exc:
             logger.debug("DashScope video poll failed", exc_info=True)
             return error_response(
@@ -315,7 +351,6 @@ class DashScopeVideoGenProvider(VideoGenProvider):
             )
 
         # Step 3: Extract video URL from result
-        # Shape: output.video_url OR output.results[].url
         video_url: Optional[str] = None
         output = poll_data.get("output", {})
         video_url = output.get("video_url")
@@ -326,7 +361,6 @@ class DashScopeVideoGenProvider(VideoGenProvider):
                     video_url = r["url"]
                     break
         if not video_url:
-            # Try nested: output.choices[].message.content[].video
             choices = output.get("choices") or []
             for c in choices:
                 msg = c.get("message", {})
