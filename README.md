@@ -6,11 +6,17 @@ Brings Alibaba's HappyHorse 1.1 video models to Hermes's `video_generate` tool. 
 
 ## Models
 
-| Model | Mode | Strengths |
-|-------|------|-----------|
-| `happyhorse-1.1-t2v` | Text-to-video | Cinematic quality from text prompts |
-| `happyhorse-1.1-i2v` | Image-to-video | Animate a still image |
-| `happyhorse-1.1-r2v` | Reference-to-video | Style/character reference driven |
+| Model Family | Modes | Strengths |
+|-------------|-------|-----------|
+| `happyhorse-1.1` | t2v, i2v, r2v | Cinematic video generation |
+
+The plugin auto-routes to the correct mode-specific model ID:
+
+| Mode | Trigger | Model ID |
+|------|---------|----------|
+| Text-to-video | prompt only | `happyhorse-1.1-t2v` |
+| Image-to-video | prompt + `image_url` | `happyhorse-1.1-i2v` |
+| Reference-to-video | prompt + `reference_image_urls` | `happyhorse-1.1-r2v` |
 
 All models are included in the Alibaba Cloud AI Token Plan subscription and are available on the PAYG free tier. Generation takes ~2-3 minutes for a 5-second clip.
 
@@ -31,14 +37,26 @@ video_gen:
   dashscope:
     api: https://token-plan.ap-southeast-1.maas.aliyuncs.com
     key_env: QWEN_API_KEY
-    model: happyhorse-1.1-t2v    # optional
+    model_family: happyhorse-1.1        # auto-appends -t2v/-i2v/-r2v
+    # model_t2v: happyhorse-1.1-t2v     # optional per-mode override
+    # model_i2v: happyhorse-1.1-i2v
+    # model_r2v: happyhorse-1.1-r2v
 ```
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `api` | `https://token-plan.ap-southeast-1.maas.aliyuncs.com` | DashScope API base URL |
 | `key_env` | `QWEN_API_KEY` | Name of the env var holding your API key |
-| `model` | `happyhorse-1.1-t2v` | Default model for generation |
+| `model_family` | `happyhorse-1.1` | Base model family; mode suffix appended automatically |
+| `model_t2v` | *(derived)* | Override the text-to-video model ID |
+| `model_i2v` | *(derived)* | Override the image-to-video model ID |
+| `model_r2v` | *(derived)* | Override the reference-to-video model ID |
+
+Model resolution (first hit wins):
+1. Explicit `model` kwarg from the tool call (full model ID)
+2. Per-mode config override (`model_t2v` / `model_i2v` / `model_r2v`)
+3. `model_family` + mode suffix (`-t2v` / `-i2v` / `-r2v`)
+4. Default family (`happyhorse-1.1`) + mode suffix
 
 Set the API key in your `.env` file:
 
@@ -62,9 +80,9 @@ No env var names are hard-coded -- `key_env` tells the plugin which env var to r
 
 Once configured, Hermes's `video_generate` tool routes through DashScope automatically:
 
-- **Text-to-video**: provide a prompt (routes to happyhorse-1.1-t2v)
-- **Image-to-video**: provide `prompt` + `image_url` (auto-routes to happyhorse-1.1-i2v)
-- **Reference-to-video**: provide `prompt` + `reference_image_urls` (routes to happyhorse-1.1-r2v)
+- **Text-to-video**: provide a prompt (routes to `-t2v`)
+- **Image-to-video**: provide `prompt` + `image_url` (routes to `-i2v`)
+- **Reference-to-video**: provide `prompt` + `reference_image_urls` (routes to `-r2v`)
 
 Supported parameters: `duration` (3-10s), `aspect_ratio` (16:9, 9:16, 1:1, 4:3, 3:4).
 

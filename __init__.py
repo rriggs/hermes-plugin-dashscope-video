@@ -10,12 +10,21 @@ Configuration (config.yaml):
       dashscope:
         api: https://token-plan.ap-southeast-1.maas.aliyuncs.com
         key_env: QWEN_API_KEY
-        model: happyhorse-1.1-t2v    # optional default model
+        model_family: happyhorse-1.1      # auto-routes: appends -t2v/-i2v/-r2v
+        # model_t2v: happyhorse-1.1-t2v   # optional per-mode override
+        # model_i2v: happyhorse-1.1-i2v
+        # model_r2v: happyhorse-1.1-r2v
 
 All keys are optional. Defaults:
-  - api:     https://token-plan.ap-southeast-1.maas.aliyuncs.com
-  - key_env: QWEN_API_KEY
-  - model:   happyhorse-1.1-t2v
+  - api:          https://token-plan.ap-southeast-1.maas.aliyuncs.com
+  - key_env:      QWEN_API_KEY
+  - model_family: happyhorse-1.1
+
+Model resolution (first hit wins):
+  1. Explicit model kwarg from the tool call (full model ID)
+  2. Per-mode config override (model_t2v / model_i2v / model_r2v)
+  3. model_family + mode suffix (-t2v / -i2v / -r2v)
+  4. Default family (happyhorse-1.1) + mode suffix
 
 For PAYG users:
   - api:     https://dashscope-intl.aliyuncs.com
@@ -51,32 +60,21 @@ from agent.video_gen_provider import (
 
 logger = logging.getLogger(__name__)
 
-_MODELS = [
+# Model families. Each family auto-routes to mode-specific model IDs
+# by appending -t2v, -i2v, or -r2v based on the input modality.
+_FAMILIES = [
     {
-        "id": "happyhorse-1.1-t2v",
-        "display": "HappyHorse 1.1 T2V",
+        "id": "happyhorse-1.1",
+        "display": "HappyHorse 1.1",
         "speed": "~90s",
-        "strengths": "Text-to-video, cinematic quality",
+        "strengths": "Cinematic video: text-to-video, image-to-video, reference-to-video",
         "price": "Token plan included",
-        "modalities": ["text"],
-    },
-    {
-        "id": "happyhorse-1.1-i2v",
-        "display": "HappyHorse 1.1 I2V",
-        "speed": "~90s",
-        "strengths": "Image-to-video animation",
-        "price": "Token plan included",
-        "modalities": ["image"],
-    },
-    {
-        "id": "happyhorse-1.1-r2v",
-        "display": "HappyHorse 1.1 R2V",
-        "speed": "~90s",
-        "strengths": "Reference-to-video, style transfer",
-        "price": "Token plan included",
-        "modalities": ["image"],
+        "modalities": ["text", "image"],
     },
 ]
+
+# Mode suffixes appended to the family ID.
+_MODE_SUFFIX = {"t2v": "-t2v", "i2v": "-i2v", "r2v": "-r2v"}
 
 # Polling config
 _POLL_INTERVAL_S = 5.0
@@ -85,6 +83,7 @@ _POLL_DEADLINE_S = 600.0  # 10 minutes max
 # Defaults when config keys are absent.
 _DEFAULT_API = "https://token-plan.ap-southeast-1.maas.aliyuncs.com"
 _DEFAULT_KEY_ENV = "QWEN_API_KEY"
+_DEFAULT_FAMILY = "happyhorse-1.1"
 
 # Aspect ratio mapping: Hermes uses "16:9" style, DashScope uses "1280*720"
 _ASPECT_TO_SIZE = {
@@ -148,10 +147,10 @@ class DashScopeVideoGenProvider(VideoGenProvider):
         return bool(os.environ.get(key_env, "").strip())
 
     def list_models(self) -> List[Dict[str, Any]]:
-        return list(_MODELS)
+        return list(_FAMILIES)
 
     def default_model(self) -> Optional[str]:
-        return "happyhorse-1.1-t2v"
+        return _DEFAULT_FAMILY
 
     def capabilities(self) -> Dict[str, Any]:
         return {
@@ -216,22 +215,33 @@ class DashScopeVideoGenProvider(VideoGenProvider):
                 provider=self.name,
             )
 
-        # Model selection: explicit > config > default
-        model_id = model or cfg.get("model") or self.default_model()
-
-        # Route based on modality
+        # Determine mode from inputs
         if image_url:
-            if model_id == "happyhorse-1.1-t2v":
-                model_id = "happyhorse-1.1-i2v"
+            mode = "i2v"
             modality = "image"
         elif reference_image_urls:
-            if model_id == "happyhorse-1.1-t2v":
-                model_id = "happyhorse-1.1-r2v"
+            mode = "r2v"
             modality = "image"
         else:
-            if model_id in ("happyhorse-1.1-i2v", "happyhorse-1.1-r2v"):
-                model_id = "happyhorse-1.1-t2v"
+            mode = "t2v"
             modality = "text"
+
+        # Model resolution:
+        # 1. Explicit model kwarg (full model ID from tool call)
+        # 2. Per-mode config override (model_t2v / model_i2v / model_r2v)
+        # 3. model_family from config + mode suffix
+        # 4. Default family + mode suffix
+        family = cfg.get("model_family", "") or _DEFAULT_FAMILY
+        if isinstance(family, str):
+            family = family.strip() or _DEFAULT_FAMILY
+        else:
+            family = _DEFAULT_FAMILY
+
+        model_id = (
+            model
+            or cfg.get(f"model_{mode}")
+            or f"{family}{_MODE_SUFFIX[mode]}"
+        )
 
         # Clamp duration
         dur = duration or 5
@@ -241,9 +251,9 @@ class DashScopeVideoGenProvider(VideoGenProvider):
         size = _ASPECT_TO_SIZE.get(aspect_ratio, "1280*720")
 
         input_data: Dict[str, Any] = {"prompt": prompt}
-        if image_url and model_id == "happyhorse-1.1-i2v":
+        if mode == "i2v" and image_url:
             input_data["image_url"] = image_url
-        elif reference_image_urls and model_id == "happyhorse-1.1-r2v":
+        elif mode == "r2v" and reference_image_urls:
             input_data["ref_image_url"] = reference_image_urls[0]
 
         payload = {
