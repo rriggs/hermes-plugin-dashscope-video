@@ -44,9 +44,12 @@ API flow (async -- required for video on both token plan and PAYG):
 
 from __future__ import annotations
 
+import base64
 import logging
+import mimetypes
 import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.video_gen_provider import (
@@ -84,6 +87,44 @@ _POLL_DEADLINE_S = 600.0  # 10 minutes max
 _DEFAULT_API = "https://token-plan.ap-southeast-1.maas.aliyuncs.com"
 _DEFAULT_KEY_ENV = "QWEN_API_KEY"
 _DEFAULT_FAMILY = "happyhorse-1.1"
+
+# Max file size for base64 inline encoding (10 MB).
+_MAX_INLINE_BYTES = 10 * 1024 * 1024
+
+
+def _to_data_uri(path: str) -> str:
+    """Convert a local image file to a base64 data URI for the API.
+
+    DashScope accepts data URIs in the ``image_url`` / ``ref_image_url``
+    fields.  Local paths are detected and converted automatically so
+    callers can pass file paths directly.
+
+    Raises ``ValueError`` for missing files or unsupported sizes.
+    """
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise ValueError(f"Image file not found: {path}")
+    if p.stat().st_size > _MAX_INLINE_BYTES:
+        raise ValueError(
+            f"Image too large for inline encoding ({p.stat().st_size} bytes, "
+            f"max {_MAX_INLINE_BYTES}). Use a URL instead."
+        )
+    mime, _ = mimetypes.guess_type(str(p))
+    if not mime or not mime.startswith("image/"):
+        mime = "image/png"  # safe fallback
+    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def _normalize_source(src: str) -> str:
+    """Return a URL or data URI suitable for the DashScope API.
+
+    - http/https URLs and data URIs pass through unchanged.
+    - Local file paths are converted to base64 data URIs.
+    """
+    if src.startswith(("http://", "https://", "data:")):
+        return src
+    return _to_data_uri(src)
 
 # Aspect ratio mapping: Hermes uses "16:9" style, DashScope uses "1280*720"
 _ASPECT_TO_SIZE = {
@@ -252,9 +293,9 @@ class DashScopeVideoGenProvider(VideoGenProvider):
 
         input_data: Dict[str, Any] = {"prompt": prompt}
         if mode == "i2v" and image_url:
-            input_data["image_url"] = image_url
+            input_data["image_url"] = _normalize_source(image_url)
         elif mode == "r2v" and reference_image_urls:
-            input_data["ref_image_url"] = reference_image_urls[0]
+            input_data["ref_image_url"] = _normalize_source(reference_image_urls[0])
 
         payload = {
             "model": model_id,

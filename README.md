@@ -82,7 +82,9 @@ Once configured, Hermes's `video_generate` tool routes through DashScope automat
 
 - **Text-to-video**: provide a prompt (routes to `-t2v`)
 - **Image-to-video**: provide `prompt` + `image_url` (routes to `-i2v`)
+  - Accepts URLs (`https://...`), data URIs (`data:image/png;base64,...`), or local file paths (`/path/to/image.png`) -- local files are automatically base64-encoded inline
 - **Reference-to-video**: provide `prompt` + `reference_image_urls` (routes to `-r2v`)
+  - Same local file path support as i2v
 
 Supported parameters: `duration` (3-10s), `aspect_ratio` (16:9, 9:16, 1:1, 4:3, 3:4).
 
